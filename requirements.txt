@@ -1,0 +1,5 @@
+# MyoTrace dependencies — tested with Python 3.13
+opencv-python==5.0.0.93
+mediapipe==0.10.30
+numpy==2.5.1
+streamlit==1.60.0

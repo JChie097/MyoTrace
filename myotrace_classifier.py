@@ -1,118 +1,173 @@
 import cv2
 import mediapipe as mp
-import numpy as np
 
-# 1. CORE LANDMARK INDEX SPECIFICATIONS (FACS Standards)
-LANDMARKS_BROW_TOP = 9  # AU4 marker (Brow center glabella)
-LANDMARKS_EYE_TOP = 159  # AU6/7 upper eyelid center
-LANDMARKS_EYE_BOTTOM = 145  # AU6/7 lower eyelid center
-LANDMARKS_NOSE_BRIDGE = 4  # AU9/10 upper nose wrinkler hub
-LANDMARKS_UPPER_LIP = 11  # AU10 upper lip lifter hub
+# Headless / edge variant of the MyoTrace pain classifier.
+# Same algorithm as app.py (the Streamlit caregiver portal): MediaPipe FaceBlendshape
+# coefficients -> per-patient neutral baseline -> EMA smoothing -> hysteresis classifier.
 
-# 2. GOOGLE TASKS API CONFIGURATION
+# --- FACS-to-blendshape signal mapping (keep in sync with app.py) ---
+BLENDSHAPE_BROW = ('browDownLeft', 'browDownRight')
+BLENDSHAPE_SQUINT = ('eyeSquintLeft', 'eyeSquintRight')
+BLENDSHAPE_LIP = ('mouthUpperUpLeft', 'mouthUpperUpRight')
+BLENDSHAPE_SMILE = ('mouthSmileLeft', 'mouthSmileRight')
+
+SMOOTH_ALPHA = 0.35
+CALIB_FRAMES = 15
+PAIN_ENTER_STREAK = 3
+PAIN_EXIT_STREAK = 3
+HYSTERESIS_MARGIN = 0.5
+
+THRESH_BROW = 12
+THRESH_EYE = 10
+THRESH_LIP = 8
+THRESH_SMILE = 20
+
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
 FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-# 3. SELF-CALIBRATING SYSTEM VARIABLES
-base_brow_dist = None
-base_eye_dist = None
-base_nose_lip_dist = None
 
-latest_status_text = "System Initializing... Look Neutral"
-latest_status_color = (255, 255, 255)
+def blendshape_pair(scores, names):
+    """Average a left/right blendshape pair into one 0..1 activation value."""
+    return (scores.get(names[0], 0.0) + scores.get(names[1], 0.0)) / 2.0
 
 
-def tracking_callback(result, output_image, timestamp_ms):
-    """THE CORE ENGINE LOGIC: Automatically self-calibrates on frame 1 to eliminate bias."""
-    global latest_status_text, latest_status_color, base_brow_dist, base_eye_dist, base_nose_lip_dist
+class PainMonitor:
+    """Per-patient calibrated pain detector over blendshape features."""
 
-    raw_list = []
-    if hasattr(result, 'face_landmarks') and result.face_landmarks:
-        raw_list = result.face_landmarks
+    def __init__(self):
+        self.base_brow = self.base_eye = self.base_lip = self.base_smile = None
+        self.calibrated = False
+        self.calib_buffer = []
+        self.smoothed_brow = self.smoothed_eye = self.smoothed_lip = self.smoothed_smile = 0.0
+        self.pain_active = False
+        self.pain_streak = 0
 
-    if raw_list is not None and len(raw_list) > 0:
-        landmarks = raw_list[0]
+    def reset(self):
+        self.__init__()
 
-        # --- PHASE 1: GEOMETRIC VECTOR EXTRACTION ---
-        pt_brow = np.array([landmarks[LANDMARKS_BROW_TOP].x, landmarks[LANDMARKS_BROW_TOP].y])
-        pt_nose = np.array([landmarks[LANDMARKS_NOSE_BRIDGE].x, landmarks[LANDMARKS_NOSE_BRIDGE].y])
-        pt_eye_t = np.array([landmarks[LANDMARKS_EYE_TOP].x, landmarks[LANDMARKS_EYE_TOP].y])
-        pt_eye_b = np.array([landmarks[LANDMARKS_EYE_BOTTOM].x, landmarks[LANDMARKS_EYE_BOTTOM].y])
-        pt_lip = np.array([landmarks[LANDMARKS_UPPER_LIP].x, landmarks[LANDMARKS_UPPER_LIP].y])
+    def on_no_face(self):
+        self.pain_active = False
+        self.pain_streak = 0
+        self.smoothed_brow = self.smoothed_eye = self.smoothed_lip = self.smoothed_smile = 0.0
 
-        # Calculate live distances
-        curr_brow_dist = np.linalg.norm(pt_brow - pt_nose)
-        curr_eye_dist = np.linalg.norm(pt_eye_t - pt_eye_b)
-        curr_nose_lip_dist = np.linalg.norm(pt_nose - pt_lip)
+    def update(self, scores):
+        """Feed one frame's blendshape scores; returns (status, color, score, signals)."""
+        raw_brow = blendshape_pair(scores, BLENDSHAPE_BROW)
+        raw_squint = blendshape_pair(scores, BLENDSHAPE_SQUINT)
+        raw_lip = blendshape_pair(scores, BLENDSHAPE_LIP)
+        raw_smile = blendshape_pair(scores, BLENDSHAPE_SMILE)
 
-        # --- DYNAMIC INITIAL CALIBRATION INJECTOR ---
-        # If no profile exists yet, save the current frame numbers as your custom resting face baseline
-        if base_brow_dist is None:
-            base_brow_dist = curr_brow_dist
-            base_eye_dist = curr_eye_dist
-            base_nose_lip_dist = curr_nose_lip_dist
-            return
+        if not self.calibrated or self.base_brow is None:
+            self.calib_buffer.append((raw_brow, raw_squint, raw_lip, raw_smile))
+            if len(self.calib_buffer) >= CALIB_FRAMES:
+                buf = self.calib_buffer
+                self.base_brow = sum(x[0] for x in buf) / len(buf)
+                self.base_eye = sum(x[1] for x in buf) / len(buf)
+                self.base_lip = sum(x[2] for x in buf) / len(buf)
+                self.base_smile = sum(x[3] for x in buf) / len(buf)
+                self.calib_buffer = []
+                self.calibrated = True
+            return "Calibrating baseline - hold a neutral expression...", "info", 0, (0, 0, 0, 0)
 
-        # --- PHASE 2: RELATIVE DEVIATION CALCULATOR ---
-        # Calculates changes relative to YOUR face structure, not generic averages
-        brow_shrinkage = max(0, ((base_brow_dist - curr_brow_dist) / base_brow_dist) * 100)
-        eye_squint = max(0, ((base_eye_dist - curr_eye_dist) / base_eye_dist) * 100)
-        nose_wrinkle = max(0, ((base_nose_lip_dist - curr_nose_lip_dist) / base_nose_lip_dist) * 100)
+        brow = max(0.0, (raw_brow - self.base_brow) * 100)
+        eye = max(0.0, (raw_squint - self.base_eye) * 100)
+        lip = max(0.0, (raw_lip - self.base_lip) * 100)
+        smile = max(0.0, (raw_smile - self.base_smile) * 100)
 
-        # --- PHASE 3: MULTI-VECTOR SIMULTANEITY CLASSIFIER ---
-        if brow_shrinkage > 22 and eye_squint > 25 and nose_wrinkle > 15:
-            pain_confidence = (brow_shrinkage + eye_squint + nose_wrinkle) / 3
-            latest_status_text = f"CRITICAL: ACUTE PHYSICAL PAIN DETECTED ({pain_confidence:.1f}%)"
-            latest_status_color = (0, 0, 255)  # Warning Red
-        elif brow_shrinkage > 20:
-            latest_status_text = "Emotion Filter: Frustration or Concentration"
-            latest_status_color = (255, 128, 0)  # Neutral Orange
-        elif eye_squint > 25:
-            latest_status_text = "Emotion Filter: Smile or Yawn"
-            latest_status_color = (255, 128, 0)  # Neutral Orange
+        self.smoothed_brow += SMOOTH_ALPHA * (brow - self.smoothed_brow)
+        self.smoothed_eye += SMOOTH_ALPHA * (eye - self.smoothed_eye)
+        self.smoothed_lip += SMOOTH_ALPHA * (lip - self.smoothed_lip)
+        self.smoothed_smile += SMOOTH_ALPHA * (smile - self.smoothed_smile)
+
+        sm = (self.smoothed_brow, self.smoothed_eye, self.smoothed_lip, self.smoothed_smile)
+
+        # Pain = ANY 2 of the 3 pain signals (brow, eye, lip), and explicitly NOT a smile.
+        pain_hits = sum([sm[0] >= THRESH_BROW, sm[1] >= THRESH_EYE, sm[2] >= THRESH_LIP])
+        all_on = pain_hits >= 2 and sm[3] < THRESH_SMILE
+        pain_still = sum([
+            sm[0] >= THRESH_BROW * HYSTERESIS_MARGIN,
+            sm[1] >= THRESH_EYE * HYSTERESIS_MARGIN,
+            sm[2] >= THRESH_LIP * HYSTERESIS_MARGIN,
+        ])
+        any_off = pain_still < 2
+
+        if self.pain_active:
+            if any_off:
+                self.pain_streak += 1
+                if self.pain_streak >= PAIN_EXIT_STREAK:
+                    self.pain_active = False
+                    self.pain_streak = 0
+            else:
+                self.pain_streak = 0
         else:
-            latest_status_text = "Patient Profile Status: Stable & Calm"
-            latest_status_color = (0, 255, 0)  # Safe Green
+            if all_on:
+                self.pain_streak += 1
+                if self.pain_streak >= PAIN_ENTER_STREAK:
+                    self.pain_active = True
+                    self.pain_streak = 0
+            else:
+                self.pain_streak = 0
+
+        if self.pain_active:
+            score = int((sm[0] + sm[1] + sm[2]) / 3)
+            return f"CRITICAL: ACUTE PHYSICAL PAIN DETECTED ({score}%)", "danger", score, sm
+        if sm[3] >= THRESH_SMILE and sm[3] >= sm[2]:
+            return "Emotion Filter: Smile / Content", "info", int(sm[3]), sm
+        if sm[0] >= THRESH_BROW:
+            return "Emotion Filter: Frustration or Concentration", "warning", int(sm[0]), sm
+        if sm[2] >= THRESH_LIP:
+            return "Emotion Filter: Upper Lip Raise (sneer/disgust)", "warning", int(sm[2]), sm
+        if sm[1] >= THRESH_EYE:
+            return "Emotion Filter: Eye Squint (discomfort or tiredness)", "warning", int(sm[1]), sm
+        return "Patient Profile Status: Stable & Calm", "success", 0, sm
 
 
-# Configure configuration properties
+COLORS = {"danger": (0, 0, 255), "warning": (0, 165, 255), "info": (180, 180, 180), "success": (0, 255, 0)}
+
 options = FaceLandmarkerOptions(
     base_options=BaseOptions(model_asset_path='face_landmarker_v2_with_blendshapes.task'),
-    running_mode=VisionRunningMode.LIVE_STREAM,
-    result_callback=tracking_callback
+    running_mode=VisionRunningMode.IMAGE,
+    output_face_blendshapes=True,
 )
 
-# 4. HARDWARE VIDEO STREAM PIPELINE
+monitor = PainMonitor()
 cap = cv2.VideoCapture(0)
-frame_timestamp = 0
 
 with FaceLandmarker.create_from_options(options) as landmarker:
-    print("\n[SYSTEM] MyoTrace Multi-Vector Pain Classifier Active.")
-    print("Look at the camera window to check live video text overlays. Press 'q' to exit.")
+    print("[SYSTEM] MyoTrace blendshape pain classifier active. 'r' = recalibrate, 'q' = quit.")
 
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
             continue
 
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-        frame_timestamp += 1
-        landmarker.detect_async(mp_image, frame_timestamp)
+        frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        result = landmarker.detect(mp_image)
 
-        # Draw the live status results directly on screen frame
-        cv2.putText(frame, latest_status_text, (30, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, latest_status_color, 2)
+        if (result.face_landmarks and result.face_blendshapes
+                and len(result.face_landmarks) > 0 and len(result.face_blendshapes) > 0):
+            blend_first = result.face_blendshapes[0]
+            blend_cats = blend_first.categories if hasattr(blend_first, "categories") else blend_first
+            scores = {c.category_name: c.score for c in blend_cats}
+            status, color, score, sm = monitor.update(scores)
+        else:
+            monitor.on_no_face()
+            status, color, score, sm = "No face detected", "info", 0, (0, 0, 0, 0)
 
-        # Render local preview frames window
-        cv2.imshow('MyoTrace Multi-Vector Backend Core', frame)
+        cv2.putText(frame, status, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLORS[color], 2)
+        cv2.putText(frame, f"brow {int(sm[0])}%  eye {int(sm[1])}%  lip {int(sm[2])}%  smile {int(sm[3])}%",
+                    (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # Press 'r' at any point while running to re-calibrate your baseline
+        cv2.imshow('MyoTrace Pain Classifier', frame)
+
         key = cv2.waitKey(5) & 0xFF
         if key == ord('r'):
-            base_brow_dist = None
-            print("\n[SYSTEM] Re-calibrating profile baseline...")
+            monitor.reset()
+            print("[SYSTEM] Re-calibrating baseline...")
         elif key == ord('q'):
             break
 
