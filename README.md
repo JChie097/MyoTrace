@@ -189,7 +189,9 @@ MyoTrace isn't a substitute for human care — it's a tool that makes that care 
 
 ⚠️ **Research prototype for demonstration only.** MyoTrace is **not a medical device** and is **not for clinical or diagnostic use**. Facial expression is one signal among many, and pain is complex; this tool provides an *assistive cue* to prompt a human caregiver to check on the patient, never a diagnosis.
 
-Known limitations: single front-facing face, reasonably front-lit and unobstructed, within a few metres of the camera.
+**Designed to monitor one person at a time.** MyoTrace tracks the single most prominent face in the frame, so it's intended for a single-patient bed or room — not for monitoring multiple people at once.
+
+Known limitations: reasonably front-lit and unobstructed framing, within a few metres of the camera.
 
 ---
 
