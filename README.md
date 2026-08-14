@@ -3,6 +3,12 @@
 > **Turn any ambient camera into structured intelligence.**
 > Continuous, on-device facial-expression monitoring that catches *silent suffering* — pain a patient can't or won't verbalize — without a single cloud API.
 
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat-square&logo=streamlit&logoColor=white)
+![OpenCV](https://img.shields.io/badge/OpenCV-5C3EE8?style=flat-square&logo=opencv&logoColor=white)
+![MediaPipe](https://img.shields.io/badge/MediaPipe-00ACC1?style=flat-square)
+![offline-first](https://img.shields.io/badge/offline--first-16a34a?style=flat-square)
+
 MyoTrace watches a patient's face through an ordinary webcam and, using Google's MediaPipe FaceLandmarker running **fully on-device**, detects facial markers of pain (brow furrowing, eye squinting, upper-lip raising). When a pain signature is detected, it raises a local alarm, logs the event to an audit trail, and — optionally — relays an alert to a nurse station over the LAN. No video ever leaves the device.
 
 ---
@@ -45,6 +51,22 @@ Existing solutions don't fit: wearable sensors are intrusive, and cloud-based AI
 6. **Respond** — the alarm tone is synthesized on-device (no audio file, no network), the event is stamped into the audit log, and an optional LAN relay can POST to a nurse station.
 
 The result is **explainable by design**: every signal is shown as a live bar against its gate, and an opt-in heatmap overlay draws the exact facial regions the model is reading.
+
+---
+
+## 🛠️ Technology Stack
+
+### 🧠 On-Device AI Engine
+MediaPipe FaceLandmarker (TensorFlow Lite) · blendshape facial-action modeling · NumPy
+
+### 📹 Computer Vision & Video
+OpenCV · local MJPEG stream (stdlib) · background capture thread
+
+### 🖥️ Dashboard & Interface
+Streamlit · live signal telemetry · Vega-Lite trend chart · CSV audit export
+
+### 🛡️ Privacy & Offline
+100% on-device inference · no cloud APIs · synthesized alarm · optional LAN relay
 
 ---
 
