@@ -448,7 +448,7 @@ PAIN_ENTER_STREAK = 3     # consecutive frames required to raise the alert
 PAIN_EXIT_STREAK = 3      # consecutive frames required to clear the alert
 HYSTERESIS_MARGIN = 0.5   # exit threshold = 50% of the enter threshold
 PAIN_SMILE_GUARD = 20     # a smile above this percent blocks pain (decoupled from the smile gate)
-HISTORY_MAX = 300         # confidence history length kept for the trend chart
+HISTORY_MAX = 2000        # confidence history kept for the trend chart (~8 min at ~4 fps; <60 KB)
 AUTO_SIGMA_K = 4.0        # auto pain gate = k × the patient's resting std-dev (z-score style)
 AUTO_FLOOR = 6            # minimum auto gate (%) so a perfectly still face isn't hyper-sensitive
 AUTO_CEIL = 35            # maximum auto gate (%) so a fidgety baseline can't desensitize the alert
@@ -470,6 +470,30 @@ def auto_gate(sigma):
     return round(min(max(AUTO_SIGMA_K * sigma * 100.0, AUTO_FLOOR), AUTO_CEIL), 1)
 
 
+def pain_confidence(brow, eye, lip, g_brow, g_eye, g_lip):
+    """0-100 pain confidence: gate-crossing count plus intensity.
+
+    Each signal earns one third of the score once it reaches its calibrated
+    gate (so "any 2 of 3 at their gates" = ~67%, the alarm threshold), plus up
+    to half again as it climbs from 1x to 2x its gate. So a harder grimace
+    reads higher confidence instead of pinning at 67%.
+    """
+    def _split(signal, gate):
+        if gate is None or gate <= 0:
+            return (1.0, 0.0) if signal > 0 else (0.0, 0.0)
+        ratio = max(0.0, signal) / gate
+        crossed = 1.0 if ratio >= 1.0 else 0.0
+        intensity = min(max(ratio - 1.0, 0.0), 1.0)  # 0 at gate, 1 at 2x gate
+        return crossed, intensity
+
+    cb, ib = _split(brow, g_brow)
+    ce, ie = _split(eye, g_eye)
+    cl, il = _split(lip, g_lip)
+    count_part = (cb + ce + cl) / 3.0 * 100.0
+    intensity_part = (ib + ie + il) / 3.0 * 100.0
+    return int(round(min(count_part + 0.5 * intensity_part, 100.0)))
+
+
 # FaceMesh landmark indices (0..467) used to draw the pain-region heatmap bands.
 HEAT_BROW = [70, 63, 105, 66, 107, 300, 293, 334, 296, 336]            # both eyebrows
 HEAT_EYE = [33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380]  # both eyes
@@ -484,6 +508,18 @@ def heat_color(pct):
         return (int(34 + (250 - 34) * t), int(197 + (204 - 197) * t), int(94 + (21 - 94) * t))
     t = (p - 50.0) / 50.0
     return (int(250 + (239 - 250) * t), int(204 + (68 - 204) * t), int(21 + (68 - 21) * t))
+
+
+def heat_color_gated(signal, gate):
+    """Map a pain signal to a heat color relative to its own gate.
+
+    At the gate the band turns yellow; at 2x the gate it saturates to red.
+    This keeps the overlay meaningful because real grimaces move signals only
+    a few percent above baseline, so a fixed 0-100 scale would never reach red.
+    """
+    if gate is None or gate <= 0:
+        return heat_color(signal)
+    return heat_color(min(signal / gate, 2.0) * 50.0)
 
 
 def region_points(landmarks, indices):
@@ -733,7 +769,7 @@ def live_dashboard():
 
             # --- STATUS EMISSION ---
             if st.session_state.pain_active:
-                latest_score = int((sm_brow + sm_eye + sm_lip) / 3)
+                latest_score = pain_confidence(sm_brow, sm_eye, sm_lip, eff_brow, eff_eye, eff_lip)
                 latest_status = f"🚨 CRITICAL: ACUTE PHYSICAL PAIN DETECTED ({latest_score}%)"
                 latest_color = "danger"
             elif sm_smile >= thresh_smile and sm_smile >= sm_lip:
@@ -770,15 +806,28 @@ def live_dashboard():
     sm_eye = st.session_state.smoothed_eye
     sm_lip = st.session_state.smoothed_lip
     sm_smile = st.session_state.smoothed_smile
-    confidence = int(min(max((sm_brow + sm_eye + sm_lip) / 3, 0), 100))
+    confidence = pain_confidence(sm_brow, sm_eye, sm_lip, eff_brow, eff_eye, eff_lip)
+    # A genuine smile drives brow/eye/lip up too, but the classifier treats it as
+    # "content", not pain (smile guard). Mirror that here so the meter can't read
+    # 100% "pain" next to a "Smile / Content" status. Keep the score during an
+    # active pain latch, because a snarl can also raise mouthSmile.
+    if sm_smile >= PAIN_SMILE_GUARD and not st.session_state.pain_active:
+        confidence = 0
 
     # Publish the pain-region heatmap so the capture thread can draw it each frame.
     # The overlay is opt-in: off by default for the clean caregiver view.
     if face_lms is not None and show_heatmap:
+        # Mirror the smile guard in the overlay too: a genuine smile drives the
+        # pain signals up, but the classifier calls it "content", so keep the
+        # bands calm while smiling (unless pain is already latched).
+        smile_blocks_pain = sm_smile >= PAIN_SMILE_GUARD and not st.session_state.pain_active
+        brow_col = heat_color(0.0) if smile_blocks_pain else heat_color_gated(sm_brow, eff_brow)
+        eye_col = heat_color(0.0) if smile_blocks_pain else heat_color_gated(sm_eye, eff_eye)
+        lip_col = heat_color(0.0) if smile_blocks_pain else heat_color_gated(sm_lip, eff_lip)
         engine.set_overlay([
-            (region_points(face_lms, HEAT_BROW), heat_color(sm_brow)),
-            (region_points(face_lms, HEAT_EYE), heat_color(sm_eye)),
-            (region_points(face_lms, HEAT_LIP), heat_color(sm_lip)),
+            (region_points(face_lms, HEAT_BROW), brow_col),
+            (region_points(face_lms, HEAT_EYE), eye_col),
+            (region_points(face_lms, HEAT_LIP), lip_col),
         ])
     else:
         engine.set_overlay(None)
