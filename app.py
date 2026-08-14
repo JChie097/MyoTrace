@@ -769,7 +769,7 @@ def live_dashboard():
 
             # --- STATUS EMISSION ---
             if st.session_state.pain_active:
-                latest_score = pain_confidence(sm_brow, sm_eye, sm_lip, eff_brow, eff_eye, eff_lip)
+                latest_score = max(pain_confidence(sm_brow, sm_eye, sm_lip, eff_brow, eff_eye, eff_lip), 50)
                 latest_status = f"🚨 CRITICAL: ACUTE PHYSICAL PAIN DETECTED ({latest_score}%)"
                 latest_color = "danger"
             elif sm_smile >= thresh_smile and sm_smile >= sm_lip:
@@ -813,6 +813,11 @@ def live_dashboard():
     # active pain latch, because a snarl can also raise mouthSmile.
     if sm_smile >= PAIN_SMILE_GUARD and not st.session_state.pain_active:
         confidence = 0
+    elif st.session_state.pain_active:
+        # During the hysteresis exit window signals may dip below their gates
+        # while the alarm is still latched; floor the score so it never reads
+        # "0% pain" next to a CRITICAL banner.
+        confidence = max(confidence, 50)
 
     # Publish the pain-region heatmap so the capture thread can draw it each frame.
     # The overlay is opt-in: off by default for the clean caregiver view.
