@@ -131,7 +131,7 @@ Recent MediaPipe Windows wheels ship a `libmediapipe.dll` that doesn't export th
 AttributeError: function 'free' not found
 ```
 
-`fix_mediapipe_windows.py` patches the binding to fall back to the Windows C runtime. **Run it once after every `pip install`** (it's idempotent — safe to re-run). This step is Windows-only; macOS and Linux are unaffected.
+`fix_mediapipe_windows.py` patches the binding to fall back to the Windows C runtime. **Run it once after every `pip install`** (it's safe to re-run). This step is Windows-only; macOS and Linux are unaffected.
 
 ### ⚠️ One camera, one tab
 
